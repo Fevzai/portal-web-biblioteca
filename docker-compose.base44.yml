@@ -1,0 +1,101 @@
+# Entorno de desarrollo para el Backend del Portal Web Biblioteca.
+# Ejecuta el código clonado (node --watch) contra un PostgreSQL local con pgvector.
+name: portal-web-biblioteca
+
+services:
+  db:
+    image: pgvector/pgvector:pg16
+    restart: on-failure
+    environment:
+      POSTGRES_USER: biblioteca
+      POSTGRES_PASSWORD: biblioteca
+      POSTGRES_DB: biblioteca
+    # El backend siempre negocia SSL (src/config/db.js), así que el servidor
+    # local se levanta con un certificado autofirmado generado en el arranque.
+    command:
+      - bash
+      - -ec
+      - |
+        mkdir -p /var/lib/postgresql/certs
+        if [ ! -f /var/lib/postgresql/certs/server.crt ]; then
+          openssl req -new -x509 -days 3650 -nodes -text \
+            -out /var/lib/postgresql/certs/server.crt \
+            -keyout /var/lib/postgresql/certs/server.key \
+            -subj "/CN=localhost"
+          chown postgres:postgres /var/lib/postgresql/certs/server.crt /var/lib/postgresql/certs/server.key
+          chmod 600 /var/lib/postgresql/certs/server.key
+        fi
+        exec docker-entrypoint.sh postgres \
+          -c ssl=on \
+          -c ssl_cert_file=/var/lib/postgresql/certs/server.crt \
+          -c ssl_key_file=/var/lib/postgresql/certs/server.key
+    volumes:
+      - db-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U biblioteca -d biblioteca"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  # Esquema + datos de ejemplo (el repositorio no incluye migraciones).
+  migrate:
+    image: pgvector/pgvector:pg16
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      PGHOST: db
+      PGUSER: biblioteca
+      PGPASSWORD: biblioteca
+      PGDATABASE: biblioteca
+      PGSSLMODE: require
+    volumes:
+      - ./Backend/db:/db:ro
+    command:
+      - bash
+      - -ec
+      - |
+        psql -v ON_ERROR_STOP=1 -f /db/01_schema.sql
+        psql -v ON_ERROR_STOP=1 -f /db/02_seed.sql
+
+  api:
+    image: node:22
+    restart: on-failure
+    working_dir: /app
+    labels:
+      base44.project: Portal Web Biblioteca API
+      base44.kind: api
+      base44.port: "3000"
+    depends_on:
+      db:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+    ports:
+      - "3000:3000"
+    environment:
+      PORT: "3000"
+      NODE_ENV: development
+      DATABASE_URL: ${DATABASE_URL:-postgresql://biblioteca:biblioteca@db:5432/biblioteca}
+      BASE44_PREVIEW_MODE:
+    volumes:
+      - ./Backend:/app
+      - api-node-modules:/app/node_modules
+    command:
+      - sh
+      - -ec
+      - npm ci --no-audit --no-fund && exec node --watch src/server.js
+    healthcheck:
+      test:
+        - CMD
+        - node
+        - -e
+        - "fetch('http://127.0.0.1:3000/').then((r) => process.exit(r.ok ? 0 : 1)).catch(() => process.exit(1))"
+      interval: 10s
+      timeout: 5s
+      retries: 6
+      start_period: 60s
+
+volumes:
+  db-data:
+  api-node-modules:
